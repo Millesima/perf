@@ -1,0 +1,150 @@
+name: Daily PSI (millesima.fr)
+
+on:
+  schedule:
+    # 05:00 UTC ~ 07:00 Europe/Paris (pendant l'heure d'été)
+    # Ajuste si besoin (hiver = 06:00 UTC pour 07:00 Paris)
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-psi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps (jq for convenience)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run PSI script (mobile + desktop)
+        env:
+          PSI_KEY: ${{ secrets.PSI_KEY }} # optionnel (quota)
+          TARGET_URL: "https://www.millesima.fr/"
+        run: |
+          node -v
+          mkdir -p scripts reports data
+          cat > scripts/psi.mjs <<'EOF'
+          import fs from "fs/promises";
+
+          const URL = process.env.TARGET_URL ?? "https://www.millesima.fr/";
+          const API_KEY = process.env.PSI_KEY ?? "";
+          const STRATS = ["mobile", "desktop"];
+          const today = new Date().toISOString().slice(0,10);
+          const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0,10);
+
+          function psiUi(url, strat){
+            return `https://pagespeed.web.dev/analysis?url=${encodeURIComponent(url)}&form_factor=${strat}`;
+          }
+
+          async function run(strat){
+            const { URL } = await import('node:url');
+            const u = new URL("https://www.googleapis.com/pagespeedonline/v5/runPagespeed");
+            u.searchParams.set("url", URL);
+            u.searchParams.set("strategy", strat);
+            ["PERFORMANCE","ACCESSIBILITY","BEST_PRACTICES","SEO"].forEach(c=>u.searchParams.append("category", c));
+            if (API_KEY) u.searchParams.set("key", API_KEY);
+
+            const res = await fetch(u, { headers: { "accept":"application/json"}});
+            if (!res.ok) {
+              const txt = await res.text();
+              throw new Error(`PSI HTTP ${res.status}: ${txt}`);
+            }
+            const json = await res.json();
+            await fs.writeFile(`data/${today}-${strat}.json`, JSON.stringify(json, null, 2));
+
+            const cat = json.lighthouseResult?.categories ?? {};
+            const scores = {
+              performance: Math.floor((cat.performance?.score ?? 0)*100),
+              accessibility: Math.floor((cat.accessibility?.score ?? 0)*100),
+              best_practices: Math.floor((cat["best-practices"]?.score ?? 0)*100),
+              seo: Math.floor((cat.seo?.score ?? 0)*100),
+            };
+
+            const le = json.loadingExperience ?? {};
+            const oe = json.originLoadingExperience ?? {};
+            const src = le.overall_category ? "URL" : (oe.overall_category ? "Origin" : null);
+            const m = (src==="URL"? le.metrics : oe.metrics) ?? {};
+            const crux = src ? {
+              source: src,
+              overall: (src==="URL"? le.overall_category : oe.overall_category),
+              LCP_ms: m.LARGEST_CONTENTFUL_PAINT_MS?.percentile ?? null,
+              INP_ms: m.INTERACTION_TO_NEXT_PAINT_MS?.percentile ?? null,
+              CLS: (m.CUMULATIVE_LAYOUT_SHIFT_SCORE?.percentile ?? null) / 1000
+            } : null;
+
+            const audits = json.lighthouseResult?.audits ?? {};
+            const opp = Object.entries(audits)
+              .map(([k,v]) => ({id:k, title:v?.title, saving: v?.details?.overallSavingsMs}))
+              .filter(x => typeof x.saving === "number")
+              .sort((a,b)=> b.saving-a.saving)
+              .slice(0,5);
+
+            let delta = null;
+            try {
+              const prevRaw = await fs.readFile(`data/${yesterday}-${strat}.json`, "utf8");
+              const prev = JSON.parse(prevRaw);
+              const pcat = prev.lighthouseResult?.categories ?? {};
+              delta = {
+                performance: Math.floor(((cat.performance?.score ?? 0) - (pcat.performance?.score ?? 0))*100),
+                accessibility: Math.floor(((cat.accessibility?.score ?? 0) - (pcat.accessibility?.score ?? 0))*100),
+                best_practices: Math.floor(((cat["best-practices"]?.score ?? 0) - (pcat["best-practices"]?.score ?? 0))*100),
+                seo: Math.floor(((cat.seo?.score ?? 0) - (pcat.seo?.score ?? 0))*100),
+              };
+            } catch { /* no yesterday */ }
+
+            return { strat, scores, crux, opportunities: opp, ui: psiUi(URL, strat), delta };
+          }
+
+          const results = [];
+          for (const s of STRATS) results.push(await run(s));
+
+          const lines = [];
+          lines.push(`# PageSpeed — ${new Date().toLocaleDateString('fr-FR')}  \n**URL : ${URL}**`);
+          for (const r of results){
+            lines.push(`\n## ${r.strat.toUpperCase()}`);
+            lines.push(`PSI : ${r.ui}`);
+            lines.push(`\n**Scores** (sur 100) : Performance ${r.scores.performance}, Accessibilité ${r.scores.accessibility}, Best Practices ${r.scores.best_practices}, SEO ${r.scores.seo}`);
+            if (r.delta){
+              const d = r.delta;
+              lines.push(`**Δ vs J-1** : Perf ${d.performance>=0?"+":""}${d.performance}, Acc ${d.accessibility>=0?"+":""}${d.accessibility}, BP ${d.best_practices>=0?"+":""}${d.best_practices}, SEO ${d.seo>=0?"+":""}${d.seo}`);
+            } else {
+              lines.push(`*(Pas de baseline J-1 détectée)*`);
+            }
+            if (r.crux){
+              const c = r.crux;
+              lines.push(`**CrUX (${c.source})** : LCP ${c.LCP_ms ?? "n/a"} ms, INP ${c.INP_ms ?? "n/a"} ms, CLS ${c.CLS ?? "n/a"} (overall: ${c.overall})`);
+            } else {
+              lines.push(`**CrUX** : n/a`);
+            }
+            lines.push(`**Top opportunités** :`);
+            if (r.opportunities.length){
+              for (const o of r.opportunities){
+                lines.push(`- ${o.title} — gain estimé ~ ${Math.round(o.saving)} ms`);
+              }
+            } else {
+              lines.push(`- (aucune “Opportunity” reportée)`);
+            }
+          }
+
+          await fs.mkdir("reports", { recursive: true });
+          await fs.writeFile(`reports/${today}.md`, lines.join("\n"));
+          console.log(lines.join("\n"));
+          EOF
+
+          node scripts/psi.mjs
+
+      - name: Commit & push results
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: "['data','reports']"
+          message: "PSI: update reports ($(date -u +'%Y-%m-%d'))"
+          default_author: github_actions
